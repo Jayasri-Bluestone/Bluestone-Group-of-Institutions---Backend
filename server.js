@@ -4,8 +4,41 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const nodemailer = require('nodemailer');
+const fs = require("fs");
+const multer = require("multer");
+const path = require("path");
 
 const app = express();
+
+
+const uploadDir = path.join(__dirname, "uploads/remarks");
+
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, "uploads/remarks");
+  },
+  filename: (req, file, cb) => {
+    const unique = Date.now() + "-" + file.originalname;
+    cb(null, unique);
+  }
+});
+
+const upload = multer({ storage });
+
+
+
+let recipientUserIds = [];
+try {
+  recipientUserIds = JSON.parse(req.body.recipientUserIds || "[]");
+} catch {
+  recipientUserIds = [];
+}
 
 // Increase limits to handle Base64 images
 app.use(express.json({ limit: '50mb' }));
@@ -367,6 +400,7 @@ await connection.query(`
         await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS paid_amount DECIMAL(12,2) DEFAULT 0`);
         await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS invalid_reason VARCHAR(255)`);
         await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS lead_code VARCHAR(20) NULL`);
+        await connection.query(`ALTER TABLE leads MODIFY COLUMN status ENUM('New', 'Follow Up', 'Waiting for Confirmation', 'Enrolled', 'Closed') DEFAULT 'New'`);
         await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS is_active TINYINT(1) NOT NULL DEFAULT 1`);
         await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS deleted_at DATETIME NULL`);
         await connection.query(`ALTER TABLE leads ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(255) NULL`);
@@ -392,7 +426,7 @@ await connection.query(`
                 is_active TINYINT(1) NOT NULL DEFAULT 1,
                 deleted_at DATETIME NULL,
                 deleted_by VARCHAR(255) NULL,
-                status ENUM('New', 'Follow Up', 'Enrolled', 'Closed') DEFAULT 'New',
+                status ENUM('New', 'Follow Up', 'Waiting for Confirmation', 'Enrolled', 'Closed') DEFAULT 'New',
                 assigned_to INT,
                 assigned_to_name VARCHAR(255),
                 assigned_by INT,
@@ -402,6 +436,7 @@ await connection.query(`
                 FOREIGN KEY (assigned_by) REFERENCES users(id) ON DELETE SET NULL
             )
         `);
+        
         // Normalize lead_code by PREFIX (not raw domain string), collision-safe in 2 phases.
         const [allLeadRows] = await connection.query(`SELECT id, domain FROM leads ORDER BY id ASC`);
         const buckets = new Map(); // prefix -> [id]
@@ -498,23 +533,8 @@ await connection.query(`
         await connection.query(`UPDATE notifications SET flag = COALESCE(flag, is_active, 1)`);
         await connection.query(`UPDATE notifications SET created_by = COALESCE(NULLIF(created_by, ''), 'System')`);
         await connection.query(`UPDATE notifications SET updated_by = COALESCE(NULLIF(updated_by, ''), created_by, 'System')`);
-        await connection.query(`
-            CREATE TABLE IF NOT EXISTS lead_remarks_messages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT NOT NULL,
-                ref_id VARCHAR(100) NOT NULL,
-                subject VARCHAR(255) NOT NULL,
-                description TEXT NOT NULL,
-                recipient_user_ids TEXT,
-                recipient_emails TEXT,
-                candidate_email VARCHAR(255),
-                sent_status ENUM('SENT', 'FAILED') DEFAULT 'FAILED',
-                sent_error TEXT,
-                created_by VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
-            )
-        `);
+        
+       
 
         // Legacy migration: if old contact_inquiries exists, mirror into leads.
         try {
@@ -1379,13 +1399,14 @@ app.get('/api/leads/assign-by/:userId', authenticateToken, async (req, res) => {
 
 app.get('/api/search/live', authenticateToken, async (req, res) => {
     const { q } = req.query;
-    const { role, domain: userDomain, id: userId } = req.user;
+    const { domain: userDomain, id: userId } = req.user;
 
     try {
         const query = (q || '').trim();
         if (!query) return res.json([]);
 
         const like = `%${query}%`;
+
         let sql = `
             SELECT 
                 id, student_name, domain, phone, email, source, category, interested_in, 
@@ -1407,9 +1428,13 @@ app.get('/api/search/live', authenticateToken, async (req, res) => {
                 CAST(id AS CHAR) LIKE ?
             )
         `;
-        let params = [like, like, like, like, like, like, like, like, like, like, like, like];
 
-        // Restriction: Staff only assigned leads; TL domain scope; admins all
+        let params = [
+            like, like, like, like, like,
+            like, like, like, like, like,
+            like, like, like
+        ];
+
         if (isStaffUser(req.user)) {
             sql += " AND assigned_to = ?";
             params.push(userId);
@@ -1417,12 +1442,18 @@ app.get('/api/search/live', authenticateToken, async (req, res) => {
             sql = appendDomainCondition(sql, params, userDomain);
         }
 
-        const [rows] = await pool.execute(sql + " ORDER BY created_at DESC LIMIT 25", params);
+        const [rows] = await pool.execute(
+            sql + " ORDER BY created_at DESC LIMIT 25",
+            params
+        );
+
         res.json(rows);
     } catch (err) {
+        console.error("LIVE SEARCH ERROR:", err);
         res.status(500).json({ error: err.message });
     }
 });
+
 
 app.post('/api/leads/bulk', authenticateToken, async (req, res) => {
     const { leads } = req.body; // Array of lead objects
@@ -1636,147 +1667,290 @@ app.get('/api/leads/:id/remark-messages', authenticateToken, async (req, res) =>
         if (!canUserAccessLead(lead, req.user)) return res.status(403).json({ msg: 'Access denied' });
 
         const [rows] = await pool.execute(
-            `SELECT id, lead_id, ref_id, subject, description, recipient_user_ids, recipient_emails,
-                    candidate_email, sent_status, sent_error, created_by, created_at
-             FROM lead_remarks_messages
-             WHERE lead_id = ?
-             ORDER BY created_at DESC, id DESC`,
-            [id]
-        );
+      `SELECT
+        id,
+        ref_id,
+        subject,
+        description,
+        attachment_base64,
+        attachment_name,
+        attachment_type,
+        sent_status,
+        created_at,
+        updated_at
+      FROM lead_remarks_messages
+      WHERE lead_id = ?
+      ORDER BY created_at DESC`,
+      [id]
+    );
+        
         res.json(rows);
     } catch (err) {
         res.status(500).json({ error: 'Could not fetch remark messages' });
     }
 });
 
-app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, res) => {
-    const { id } = req.params;
-    const { ref_id, subject, description, recipientUserIds = [] } = req.body;
+app.get('/api/remark-message-history/:messageId', authenticateToken, async (req, res) => {
 
-    if (!ref_id || !subject || !description) {
-        return res.status(400).json({ msg: 'ref_id, subject and description are required' });
-    }
+  try {
 
-    try {
-        await pool.execute(`
-            CREATE TABLE IF NOT EXISTS lead_remarks_messages (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                lead_id INT NOT NULL,
-                ref_id VARCHAR(100) NOT NULL,
-                subject VARCHAR(255) NOT NULL,
-                description TEXT NOT NULL,
-                recipient_user_ids TEXT,
-                recipient_emails TEXT,
-                candidate_email VARCHAR(255),
-                sent_status ENUM('SENT', 'FAILED') DEFAULT 'FAILED',
-                sent_error TEXT,
-                created_by VARCHAR(255),
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (lead_id) REFERENCES leads(id) ON DELETE CASCADE
-            )
-        `);
+    const { messageId } = req.params;
 
-        const [leadRows] = await pool.execute(
-            'SELECT id, lead_code, student_name, email, domain, assigned_to, is_active FROM leads WHERE id = ? AND is_active = 1',
-            [id]
-        );
-        if (leadRows.length === 0) return res.status(404).json({ msg: 'Lead not found' });
-        const lead = leadRows[0];
-        if (!canUserAccessLead(lead, req.user)) return res.status(403).json({ msg: 'Access denied' });
+    const [rows] = await pool.execute(
+      `SELECT
+        id,
+        message_id,
+        subject,
+        description,
+        edited_by,
+        edited_at
+       FROM lead_remarks_messages_history
+       WHERE message_id = ?
+       ORDER BY edited_at DESC`,
+      [messageId]
+    );
 
-        const normalizedIds = Array.from(
-            new Set((Array.isArray(recipientUserIds) ? recipientUserIds : [])
-                .map((v) => Number(v))
-                .filter((v) => Number.isInteger(v) && v > 0))
-        );
+    res.json(rows);
 
-        let staffRows = [];
-        if (normalizedIds.length > 0) {
-            const aliases = getDomainAliases(lead.domain);
-            const idPlaceholders = normalizedIds.map(() => '?').join(', ');
-            const domainPlaceholders = aliases.map(() => '?').join(', ');
-            const [rows] = await pool.execute(
-                `SELECT id, name, email, phone, role, domain
-                 FROM users
-                 WHERE is_active = 1
-                   AND role IN ('TL', 'Staff')
-                   AND id IN (${idPlaceholders})
-                   AND domain IN (${domainPlaceholders})`,
-                [...normalizedIds, ...aliases]
-            );
-            staffRows = rows;
-        }
+  } catch (err) {
 
-        const candidateEmail = String(lead.email || '').trim();
-        const staffEmails = staffRows.map((u) => String(u.email || '').trim()).filter(Boolean);
-        const toEmails = Array.from(new Set([candidateEmail, ...staffEmails].filter(Boolean)));
+    console.error("History fetch error:", err);
 
-        const html = `
-            <div style="font-family: Arial, sans-serif; line-height: 1.5;">
-                <h3>Lead Remark Update</h3>
-                <p><strong>Ref ID:</strong> ${String(ref_id)}</p>
-                <p><strong>Candidate:</strong> ${String(lead.student_name || '')}</p>
-                <p><strong>Domain:</strong> ${String(lead.domain || '')}</p>
-                <p><strong>Subject:</strong> ${String(subject)}</p>
-                <p><strong>Description:</strong><br/>${String(description).replace(/\n/g, '<br/>')}</p>
-            </div>
-        `;
+    res.status(500).json({ error: "Failed to fetch history" });
 
-        let sentStatus = 'FAILED';
-        let sentError = '';
-        if (toEmails.length === 0) {
-            sentError = 'No recipient email available for candidate/staff';
-        } else {
-            const transporter = createMailTransporter();
-            if (!transporter) {
-                sentError = 'SMTP is not configured on server';
-            } else {
-                try {
-                    await transporter.sendMail({
-                        from: SMTP_CONFIG.from || SMTP_CONFIG.user,
-                        to: toEmails.join(','),
-                        subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
-                        html
-                    });
-                    sentStatus = 'SENT';
-                } catch (mailErr) {
-                    sentError = `Mail send failed: ${mailErr.message}`;
-                }
-            }
-        }
+  }
 
-        const createdBy = formatWho(req.user);
-        await pool.execute(
-            `INSERT INTO lead_remarks_messages
-             (lead_id, ref_id, subject, description, recipient_user_ids, recipient_emails, candidate_email, sent_status, sent_error, created_by)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-                id,
-                String(ref_id).trim(),
-                String(subject).trim(),
-                String(description).trim(),
-                JSON.stringify(staffRows.map((u) => u.id)),
-                staffEmails.join(','),
-                candidateEmail || null,
-                sentStatus,
-                sentError || null,
-                createdBy
-            ]
-        );
-
-        if (sentStatus !== 'SENT') {
-            return res.status(400).json({ msg: `Saved, but mail not sent: ${sentError}` });
-        }
-        return res.status(201).json({ msg: 'Remark saved and mail sent' });
-    } catch (err) {
-        console.error('Remark send route error:', err.message);
-        return res.status(500).json({ error: 'Failed to save/send remark message', details: err.message });
-    }
 });
 
-app.put('/api/leads/:id/remark-messages/:messageId', authenticateToken, async (req, res) => {
-    const { id, messageId } = req.params;
+
+app.post('/api/leads/:id/remark-messages/send', authenticateToken, async (req, res) => {
+
+  const { id } = req.params;
+
+  let {
+    ref_id,
+    subject,
+    description,
+    recipientUserIds = [],
+    attachment_base64,
+    attachment_name,
+    attachment_type
+  } = req.body;
+
+  // Safe parse recipient ids
+  try {
+    if (typeof recipientUserIds === "string") {
+      recipientUserIds = JSON.parse(recipientUserIds);
+    }
+  } catch {
+    recipientUserIds = [];
+  }
+
+  if (!ref_id || !subject || !description) {
+    return res.status(400).json({
+      msg: "ref_id, subject and description are required"
+    });
+  }
+
+  try {
+
+    const [leadRows] = await pool.execute(
+      `SELECT id, lead_code, student_name, email, domain, assigned_to, is_active
+       FROM leads
+       WHERE id = ? AND is_active = 1`,
+      [id]
+    );
+
+    if (leadRows.length === 0) {
+      return res.status(404).json({ msg: "Lead not found" });
+    }
+
+    const lead = leadRows[0];
+
+    if (!canUserAccessLead(lead, req.user)) {
+      return res.status(403).json({ msg: "Access denied" });
+    }
+
+    // Normalize recipient IDs
+    const normalizedIds = Array.from(
+      new Set(
+        (Array.isArray(recipientUserIds) ? recipientUserIds : [])
+          .map((v) => Number(v))
+          .filter((v) => Number.isInteger(v) && v > 0)
+      )
+    );
+
+    let staffRows = [];
+
+    if (normalizedIds.length > 0) {
+
+      const aliases = getDomainAliases(lead.domain);
+
+      const idPlaceholders = normalizedIds.map(() => "?").join(",");
+      const domainPlaceholders = aliases.map(() => "?").join(",");
+
+      const [rows] = await pool.execute(
+        `SELECT id, name, email, phone, role, domain
+         FROM users
+         WHERE is_active = 1
+         AND role IN ('TL','Staff')
+         AND id IN (${idPlaceholders})
+         AND domain IN (${domainPlaceholders})`,
+        [...normalizedIds, ...aliases]
+      );
+
+      staffRows = rows;
+    }
+
+    const candidateEmail = String(lead.email || "").trim();
+
+    const staffEmails = staffRows
+      .map((u) => String(u.email || "").trim())
+      .filter(Boolean);
+
+    const toEmails = Array.from(
+      new Set([candidateEmail, ...staffEmails].filter(Boolean))
+    );
+
+    // Email HTML
+    const html = `
+      <div style="font-family: Arial, sans-serif;">
+        <h3>Lead Remark Update</h3>
+
+        <p><strong>Ref ID:</strong> ${ref_id}</p>
+
+        <p><strong>Candidate:</strong> ${lead.student_name || ""}</p>
+
+        <p><strong>Domain:</strong> ${lead.domain || ""}</p>
+
+        <p><strong>Subject:</strong> ${subject}</p>
+
+        <p><strong>Description:</strong><br/>
+        ${description.replace(/\n/g, "<br/>")}
+        </p>
+      </div>
+    `;
+
+    let sentStatus = "FAILED";
+    let sentError = "";
+
+    if (toEmails.length === 0) {
+      sentError = "No recipient email available";
+    } else {
+
+      const transporter = createMailTransporter();
+
+      if (!transporter) {
+        sentError = "SMTP not configured";
+      } else {
+
+        try {
+
+          const mailOptions = {
+  from: SMTP_CONFIG.from || SMTP_CONFIG.user,
+  to: toEmails.join(","),
+  subject: `[Lead ${lead.lead_code || lead.id}] ${subject}`,
+  html
+};
+
+// Attach file if present
+if (attachment_base64) {
+
+  const base64Data = attachment_base64.split("base64,")[1];
+
+  mailOptions.attachments = [
+    {
+      filename: attachment_name || "attachment",
+      content: base64Data,
+      encoding: "base64",
+      contentType: attachment_type
+    }
+  ];
+
+}
+
+await transporter.sendMail(mailOptions);
+
+          sentStatus = "SENT";
+
+        } catch (mailErr) {
+
+          sentError = `Mail send failed: ${mailErr.message}`;
+
+        }
+
+      }
+    }
+
+    const createdBy = formatWho(req.user);
+
+    // Save to database
+    await pool.execute(
+      `INSERT INTO lead_remarks_messages
+      (
+        lead_id,
+        ref_id,
+        subject,
+        description,
+        recipient_user_ids,
+        recipient_emails,
+        candidate_email,
+        sent_status,
+        sent_error,
+        created_by,
+        attachment_base64,
+        attachment_name,
+        attachment_type
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id,
+        ref_id,
+        subject,
+        description,
+        JSON.stringify(normalizedIds),
+        staffEmails.join(","),
+        candidateEmail,
+        sentStatus,
+        sentError || null,
+        createdBy,
+        attachment_base64 || null,
+        attachment_name || null,
+        attachment_type || null
+      ]
+    );
+
+    if (sentStatus !== "SENT") {
+      return res.status(400).json({
+        msg: `Saved, but mail not sent: ${sentError}`
+      });
+    }
+    
+
+    return res.status(201).json({
+      msg: "Remark saved and mail sent"
+    });
+
+  } catch (err) {
+
+    console.error("Remark send route error:", err);
+
+    return res.status(500).json({
+      error: "Failed to save/send remark message",
+      details: err.message
+    });
+
+  }
+
+});
+
+app.put('/api/leads/:id/remark-messages/:messageId',
+  authenticateToken,
+  upload.single("attachment"),
+  async (req, res) => {
+        const { id, messageId } = req.params;
     const { ref_id, subject, description, recipientUserIds = [] } = req.body;
+    const attachmentPath = req.file ? req.file.filename : null;
 
     if (!ref_id || !subject || !description) {
         return res.status(400).json({ msg: 'ref_id, subject and description are required' });
@@ -1791,10 +1965,35 @@ app.put('/api/leads/:id/remark-messages/:messageId', authenticateToken, async (r
         const lead = leadRows[0];
         if (!canUserAccessLead(lead, req.user)) return res.status(403).json({ msg: 'Access denied' });
 
-        const [msgRows] = await pool.execute(
-            'SELECT id FROM lead_remarks_messages WHERE id = ? AND lead_id = ?',
-            [messageId, id]
-        );
+       const [msgRows] = await pool.execute(
+    'SELECT * FROM lead_remarks_messages WHERE id = ? AND lead_id = ?',
+    [messageId, id]
+);
+
+if (msgRows.length === 0) {
+    return res.status(404).json({ msg: 'Message not found' });
+}
+
+const oldMessage = msgRows[0];
+
+// 🔹 Save old message into history
+await pool.execute(
+    `INSERT INTO lead_remarks_messages_history
+    (message_id, lead_id, ref_id, subject, description,
+     attachment_base64, attachment_name, attachment_type, edited_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+        oldMessage.id,
+        oldMessage.lead_id,
+        oldMessage.ref_id,
+        oldMessage.subject,
+        oldMessage.description,
+        oldMessage.attachment_base64,
+        oldMessage.attachment_name,
+        oldMessage.attachment_type,
+        formatWho(req.user)
+    ]
+);
         if (msgRows.length === 0) return res.status(404).json({ msg: 'Message not found' });
 
         const normalizedIds = Array.from(
@@ -1910,6 +2109,30 @@ app.delete('/api/leads/:id/remark-messages/:messageId', authenticateToken, async
     }
 });
 
+app.get('/api/leads/remark-history/:messageId', authenticateToken, async (req,res)=>{
+
+  try{
+
+    const { messageId } = req.params;
+
+    const [rows] = await pool.execute(
+      `SELECT *
+       FROM lead_remarks_messages_history
+       WHERE message_id=?
+       ORDER BY edited_at DESC`,
+       [messageId]
+    );
+
+    res.json(rows);
+
+  }catch(err){
+
+    console.error("History fetch error:",err);
+
+    res.status(500).json({error:"Failed to fetch history"});
+  }
+
+});
 // --- NOTIFICATION / LIVE FEED ROUTES ---
 
 // 1. Get all active notifications
@@ -2007,21 +2230,7 @@ app.delete('/api/notifications/:id', authenticateToken, async (req, res) => {
     }
 });
 
-// POST: Add a new message to the day's list
-app.post("/api/notifications", async (req, res) => {
-  const { date, message } = req.body;
 
-  try {
-    await pool.execute(
-      `INSERT INTO notifications (date, message, is_active) VALUES (?, ?, 1)`,
-      [date, message]
-    );
-
-    res.json({ message: "Notification added" });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 
 app.patch('/api/notifications/:id/status', authenticateToken, async (req, res) => {
   const { id } = req.params;
@@ -2087,15 +2296,19 @@ app.put("/api/notifications/toggle/:id", async (req, res) => {
 app.get('/api/notifications/calendar', authenticateToken, async (req, res) => {
   const { month } = req.query; // YYYY-MM
 
+  const start = `${month}-01`;
+  const end = `${month}-31`;
+
   try {
     const [rows] = await pool.execute(
-      `SELECT DATE_FORMAT(date, '%Y-%m-%d') as date_key, COUNT(*) as count
+      `SELECT DATE(date) as date_key, COUNT(*) as count
        FROM notifications
-       WHERE DATE_FORMAT(date, '%Y-%m') = ?
-         AND flag = 1
+       WHERE date BETWEEN ? AND ?
+       AND flag = 1
+       AND is_active = 1
        GROUP BY DATE(date)
        ORDER BY DATE(date) ASC`,
-      [month]
+      [start, end]
     );
 
     res.json(rows);
